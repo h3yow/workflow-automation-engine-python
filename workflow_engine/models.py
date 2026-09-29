@@ -5,7 +5,6 @@ from __future__ import annotations
 import enum
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
 
 
 class StepStatus(str, enum.Enum):
@@ -32,6 +31,10 @@ STEP_TERMINAL_STATUSES = frozenset(
     {StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED}
 )
 
+# 运行内部并发度的向后兼容默认值：
+# 未显式配置 max_concurrency 的定义版本（含旧版本）按此值调度。
+DEFAULT_MAX_CONCURRENCY = 4
+
 
 class WorkflowError(Exception):
     """引擎异常基类。"""
@@ -47,6 +50,16 @@ class InvalidDefinitionError(WorkflowError):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+class InvalidConcurrencyError(InvalidDefinitionError):
+    """并发上限配置非法（如小于 1）。
+
+    继承自 InvalidDefinitionError（仍属于发布期定义校验失败，HTTP 422），
+    但 reason 可与其它校验失败明确区分。
+    """
+
+    reason = "invalid_concurrency"
 
 
 class DuplicateTriggerError(WorkflowError):
@@ -134,6 +147,15 @@ class WorkflowDef:
     version: int
     steps: tuple[StepDef, ...]
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    # 运行内部并发上限；None 表示该版本未显式配置，触发时回落到
+    # 向后兼容默认值 DEFAULT_MAX_CONCURRENCY。不同版本可配置不同值。
+    max_concurrency: int | None = None
+
+    def effective_max_concurrency(self) -> int:
+        """触发时实际生效的并发上限（锁定到运行快照上）。"""
+        if self.max_concurrency is None:
+            return DEFAULT_MAX_CONCURRENCY
+        return self.max_concurrency
 
     def step_ids(self) -> frozenset[str]:
         return frozenset(step.id for step in self.steps)
@@ -166,6 +188,9 @@ class RunState:
     definition: WorkflowDef
     status: RunStatus = RunStatus.RUNNING
     steps: dict[str, StepState] = field(default_factory=dict)
+    # 触发瞬间从定义快照解析出的并发上限，运行期间锁定；
+    # 之后再发布新版本（即便并发度不同）也不影响本次运行。
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
     started_at: float | None = None
     finished_at: float | None = None
 
@@ -176,6 +201,7 @@ class RunState:
             run_id=run_id,
             definition=definition,
             steps=steps,
+            max_concurrency=definition.effective_max_concurrency(),
             started_at=now,
         )
 

@@ -5,11 +5,30 @@ from __future__ import annotations
 import threading
 
 from .models import (
+    DEFAULT_MAX_CONCURRENCY,
+    InvalidConcurrencyError,
     InvalidDefinitionError,
     RetryPolicy,
     StepDef,
     WorkflowDef,
 )
+
+
+def _validate_concurrency(definition: WorkflowDef) -> None:
+    """校验运行内部并发上限；未配置时回落到默认值，配置则必须为 >= 1 的整数。"""
+    value = definition.max_concurrency
+    if value is None:
+        return
+    # bool 是 int 的子类型，明确拒绝，避免 True 被当成 1 静默接受
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidConcurrencyError(
+            f"max_concurrency must be an integer >= 1, got {value!r}"
+        )
+    if value < 1:
+        raise InvalidConcurrencyError(
+            f"max_concurrency must be >= 1, got {value} "
+            f"(default when unset is {DEFAULT_MAX_CONCURRENCY})"
+        )
 
 
 def _validate_retry_policy(policy: RetryPolicy) -> None:
@@ -38,6 +57,8 @@ def validate_definition(definition: WorkflowDef) -> None:
     - 依赖图存在环（含自依赖）
     - 步骤级 max_attempts 覆盖值 < 1
     - 重试退避参数非法
+    - max_concurrency 非整数或 < 1（reason=invalid_concurrency，
+      与其它定义校验失败区分）
     """
     if not definition.name or not definition.name.strip():
         raise InvalidDefinitionError("workflow name must not be empty")
@@ -46,6 +67,7 @@ def validate_definition(definition: WorkflowDef) -> None:
             f"definition version must be >= 1, got {definition.version}"
         )
 
+    _validate_concurrency(definition)
     _validate_retry_policy(definition.retry_policy)
 
     if not definition.steps:
@@ -150,8 +172,13 @@ def build_definition(
     version: int,
     raw_steps: list[dict],
     retry_policy: RetryPolicy | None = None,
+    max_concurrency: int | None = None,
 ) -> WorkflowDef:
-    """从朴素数据结构构建 WorkflowDef（只构造对象，不做发布）。"""
+    """从朴素数据结构构建 WorkflowDef（只构造对象，不做发布）。
+
+    max_concurrency 为 None 时表示该版本不显式配置并发上限，
+    触发运行时按 DEFAULT_MAX_CONCURRENCY 调度。
+    """
     steps = tuple(
         StepDef(
             id=raw["id"],
@@ -165,4 +192,5 @@ def build_definition(
         version=version,
         steps=steps,
         retry_policy=retry_policy or RetryPolicy(),
+        max_concurrency=max_concurrency,
     )

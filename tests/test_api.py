@@ -96,3 +96,58 @@ def test_run_not_found_returns_404():
     resp = client.get("/runs/missing")
     assert resp.status_code == 404
     assert resp.json()["error"]["reason"] == "run_not_found"
+
+
+def test_publish_and_run_with_concurrency_cap():
+    client, _ = _build_client()
+    # 显式配置并发上限 1
+    resp = client.post(
+        "/definitions",
+        json={
+            "name": "wf", "version": 1,
+            "steps": [{"id": "a"}, {"id": "b"}],
+            "max_concurrency": 1,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.json()["max_concurrency"] == 1
+
+    resp = client.post("/runs", json={"run_id": "run-cap-api"})
+    assert resp.status_code == 202
+    body = resp.json()
+    # 运行锁定触发时的并发上限
+    assert body["max_concurrency"] == 1
+    assert body["status"] == "succeeded"
+
+
+def test_unset_concurrency_uses_default_in_run_response():
+    from workflow_engine.models import DEFAULT_MAX_CONCURRENCY
+
+    client, _ = _build_client()
+    client.post(
+        "/definitions",
+        json={"name": "wf", "version": 1, "steps": [{"id": "a"}]},
+    )
+    resp = client.post("/runs", json={"run_id": "run-default-cap"})
+    assert resp.status_code == 202
+    assert resp.json()["max_concurrency"] == DEFAULT_MAX_CONCURRENCY
+
+
+def test_invalid_concurrency_returns_distinguishable_422():
+    client, _ = _build_client()
+    resp = client.post(
+        "/definitions",
+        json={
+            "name": "wf", "version": 1,
+            "steps": [{"id": "a"}],
+            "max_concurrency": 0,
+        },
+    )
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    # 可与其它定义校验失败区分的原因码
+    assert error["reason"] == "invalid_concurrency"
+    assert "max_concurrency" in error["message"]
+    logger.info(
+        "reason=api_invalid_concurrency_rejected http_status=422"
+    )

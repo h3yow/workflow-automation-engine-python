@@ -11,7 +11,9 @@ from .definitions import DefinitionRegistry, build_definition, validate_definiti
 from .engine import WorkflowEngine
 from .executor import ActionRegistry, StepExecutor
 from .models import (
+    DEFAULT_MAX_CONCURRENCY,
     FatalStepError,
+    InvalidConcurrencyError,
     RecoverableStepError,
     RetryPolicy,
     RunState,
@@ -24,8 +26,10 @@ from .models import (
 
 __all__ = [
     "ActionRegistry",
+    "DEFAULT_MAX_CONCURRENCY",
     "DefinitionRegistry",
     "FatalStepError",
+    "InvalidConcurrencyError",
     "RecoverableStepError",
     "RetryPolicy",
     "RunState",

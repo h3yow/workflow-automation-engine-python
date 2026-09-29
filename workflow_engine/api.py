@@ -38,6 +38,8 @@ class DefinitionIn(BaseModel):
     version: int
     steps: list[StepDefIn]
     retry_policy: RetryPolicyIn | None = None
+    # 运行内部并发上限；省略时该版本按默认值 DEFAULT_MAX_CONCURRENCY 调度。
+    max_concurrency: int | None = None
 
 
 class TriggerIn(BaseModel):
@@ -56,6 +58,8 @@ def _serialize_run(state: RunState) -> dict[str, Any]:
         "run_id": state.run_id,
         "status": state.status.value,
         "definition_version": state.definition.version,
+        # 本次运行触发时锁定的并发上限（之后发布新版本不改变它）
+        "max_concurrency": state.max_concurrency,
         "started_at": state.started_at,
         "finished_at": state.finished_at,
         "steps": [
@@ -100,16 +104,19 @@ def create_app(
             version=payload.version,
             raw_steps=[step.model_dump() for step in payload.steps],
             retry_policy=policy,
+            max_concurrency=payload.max_concurrency,
         )
         try:
             registry.put(definition)
         except InvalidDefinitionError as exc:
-            # 422 + reason=invalid_definition：缺信息 / 自相矛盾的定义
-            return _error(422, InvalidDefinitionError.reason, exc.message)
+            # 422 + 具体 reason：普通定义问题为 invalid_definition，
+            # 并发配置非法为 invalid_concurrency（可与其它校验失败区分）
+            return _error(422, exc.reason, getattr(exc, "message", str(exc)))
         return {
             "name": definition.name,
             "version": definition.version,
             "steps": len(definition.steps),
+            "max_concurrency": definition.effective_max_concurrency(),
         }
 
     @app.post("/runs")
@@ -120,7 +127,9 @@ def create_app(
             # 409 + reason=duplicate_trigger：可区分的拒绝结果
             return _error(409, DuplicateTriggerError.reason, str(exc))
         except InvalidDefinitionError as exc:
-            return _error(422, InvalidDefinitionError.reason, exc.message)
+            return _error(
+                422, exc.reason, getattr(exc, "message", str(exc))
+            )
         return JSONResponse(status_code=202, content=_serialize_run(state))
 
     @app.get("/runs/{run_id}")
