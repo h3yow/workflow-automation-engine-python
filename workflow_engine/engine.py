@@ -11,16 +11,15 @@ from typing import Any
 from .definitions import DefinitionRegistry
 from .executor import ActionRegistry, SleepProtocol, StepExecutor
 from .models import (
+    DEFAULT_MAX_CONCURRENCY,
     DuplicateTriggerError,
     RunNotFoundError,
     RunState,
     RunStatus,
-    StepDef,
-    StepState,
-    StepStatus,
     WorkflowDef,
     new_run_id,
 )
+from .scheduler import ConcurrentScheduler
 
 logger = logging.getLogger("workflow_engine")
 
@@ -34,10 +33,13 @@ class WorkflowEngine:
     - 同一 run_id 的重复/并发触发，在全局注册锁内原子完成
       “检查 + 登记”，保证只有一个被接受，其余抛 DuplicateTriggerError，
       任何步骤副作用都不会因重复触发而执行两次。
-    - 每个运行在独立后台线程内按依赖顺序调度步骤；不同运行天然并发。
-      单个运行内步骤按拓扑序推进，只有全部前置 SUCCEEDED 才执行该步骤。
-    - 步骤失败（不可恢复或重试耗尽）后，该步骤标记 FAILED，其全部
-      传递下游标记 SKIPPED（并记录失败来源步骤）；运行整体标记 FAILED。
+    - 每个运行在独立后台线程内调度步骤；不同运行天然并发。
+      单个运行内由 ConcurrentScheduler 按依赖关系做有界并发：
+      无依赖关系的步骤可同时执行，RUNNING 数量不超过锁定的上限，
+      满额则排队等空位。
+    - 步骤失败（不可恢复或重试耗尽）后：该步骤 FAILED 且成为根因，
+      不再派发任何新步骤；在跑的其它分支自然跑完；最终所有未决步骤
+      收敛为 SKIPPED（failed_by_step 可回溯到根因），运行整体 FAILED。
     """
 
     def __init__(
@@ -47,7 +49,15 @@ class WorkflowEngine:
         sleep_protocol: SleepProtocol | None = None,
         time_func: Callable[[], float] | None = None,
         run_asynchronously: bool = True,
+        default_max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     ) -> None:
+        if isinstance(default_max_concurrency, bool) or not isinstance(
+            default_max_concurrency, int
+        ) or default_max_concurrency < 1:
+            raise ValueError(
+                "default_max_concurrency must be an integer >= 1, got "
+                f"{default_max_concurrency!r}"
+            )
         self._definitions = definitions
         self._executor = StepExecutor(
             actions, sleep_protocol=sleep_protocol, time_func=time_func
@@ -55,6 +65,8 @@ class WorkflowEngine:
         self._time = time_func or time.time
         # run_asynchronously=False 时触发线程内直接跑完（便于测试）
         self._async = run_asynchronously
+        # 定义未显式配置并发上限（如历史旧版本）时使用的兼容默认值
+        self._default_max_concurrency = default_max_concurrency
         self._registry_lock = threading.Lock()
         self._runs: dict[str, RunState] = {}
         self._run_threads: dict[str, threading.Thread] = {}
@@ -85,6 +97,13 @@ class WorkflowEngine:
         """
         run_id = run_id or new_run_id()
         snapshot = definition or self._definitions.current()
+        # 触发瞬间锁定并发度：定义版本优先；旧定义未配置时用兼容默认值。
+        # 之后发布新版本（哪怕并发度不同）不影响本次运行。
+        locked_concurrency = (
+            snapshot.max_concurrency
+            if snapshot.max_concurrency is not None
+            else self._default_max_concurrency
+        )
 
         # 原子“检查 + 登记”，杜绝并发重复触发
         with self._registry_lock:
@@ -98,13 +117,17 @@ class WorkflowEngine:
                     run_id, existing.status.value, existing.definition.version,
                 )
                 raise DuplicateTriggerError(run_id)
-            state = RunState.new(run_id, snapshot, self._time())
+            state = RunState.new(
+                run_id, snapshot, self._time(), max_concurrency=locked_concurrency
+            )
             self._runs[run_id] = state
             self._done_events[run_id] = threading.Event()
             self._results[run_id] = {}
             logger.info(
-                "run_id=%s reason=run_triggered def_name=%s def_version=%d steps=%d",
+                "run_id=%s reason=run_triggered def_name=%s def_version=%d "
+                "steps=%d max_concurrency=%d",
                 run_id, snapshot.name, snapshot.version, len(snapshot.steps),
+                locked_concurrency,
             )
             if self._async and not wait:
                 thread = threading.Thread(
@@ -146,48 +169,41 @@ class WorkflowEngine:
         for thread in threads:
             thread.join(timeout=timeout)
 
+
     # ------------------------------------------------------------------ #
-    # 流水线执行（每个运行一个线程）
+    # 流水线执行（每个运行一个调度线程，内部步骤有界并发）
     # ------------------------------------------------------------------ #
 
     def _run_pipeline(self, run_id: str) -> None:
         state = self.get_run(run_id)
         definition = state.definition  # 快照：运行期间定义变更与本运行无关
         try:
-            # Kahn 拓扑序；定义已校验无环
-            order = self._topological_order(definition)
             results = self._results[run_id]
-            for step_id in order:
-                step_state = state.steps[step_id]
-                step_def = definition.get_step(step_id)
-                assert step_def is not None
-
-                # 失败传播：若任一前置 FAILED/SKIPPED，则本步骤 SKIPPED
-                blocker = self._first_blocker(definition, step_def, state)
-                if blocker is not None:
-                    self._mark_skipped(step_state, blocker, run_id)
-                    continue
-
-                inputs = {
-                    dep: results[dep]
-                    for dep in step_def.depends_on
-                    if dep in results
-                }
-                status, result = self._executor.execute_step(
-                    run_id, definition, step_def, step_state, inputs
-                )
-                if status is StepStatus.SUCCEEDED:
-                    results[step_id] = result
-                else:
-                    self._finalize_failure(run_id, state, step_id, order)
-                    return
-
-            state.status = RunStatus.SUCCEEDED
-            state.finished_at = self._time()
-            logger.info(
-                "run_id=%s reason=run_succeeded def_version=%d",
-                run_id, definition.version,
+            scheduler = ConcurrentScheduler(
+                state=state,
+                executor=self._executor,
+                results=results,
+                time_func=self._time,
             )
+            failed_root = scheduler.run()
+
+            if failed_root is None:
+                state.status = RunStatus.SUCCEEDED
+                state.finished_at = self._time()
+                logger.info(
+                    "run_id=%s reason=run_succeeded def_version=%d "
+                    "max_concurrency=%d",
+                    run_id, definition.version, state.max_concurrency,
+                )
+            else:
+                state.status = RunStatus.FAILED
+                state.finished_at = self._time()
+                logger.error(
+                    "run_id=%s reason=run_failed failed_step_id=%s "
+                    "def_version=%d max_concurrency=%d",
+                    run_id, failed_root, definition.version,
+                    state.max_concurrency,
+                )
         except Exception:
             logger.exception("run_id=%s reason=run_crashed", run_id)
             state.status = RunStatus.FAILED
@@ -201,74 +217,3 @@ class WorkflowEngine:
                 "run_id=%s reason=run_finished final_status=%s",
                 run_id, state.status.value,
             )
-
-    def _finalize_failure(
-        self,
-        run_id: str,
-        state: RunState,
-        failed_step_id: str,
-        order: list[str],
-    ) -> None:
-        """失败步骤之后的所有未完成步骤标记 SKIPPED，并收敛运行终态。"""
-        failed_index = order.index(failed_step_id)
-        for downstream_id in order[failed_index + 1:]:
-            downstream_state = state.steps[downstream_id]
-            if downstream_state.status not in (
-                StepStatus.SUCCEEDED,
-                StepStatus.FAILED,
-                StepStatus.SKIPPED,
-            ):
-                self._mark_skipped(downstream_state, failed_step_id, run_id)
-        state.status = RunStatus.FAILED
-        state.finished_at = self._time()
-        logger.error(
-            "run_id=%s reason=run_failed failed_step_id=%s",
-            run_id, failed_step_id,
-        )
-
-    @staticmethod
-    def _mark_skipped(
-        step_state: StepState, failed_by_step: str, run_id: str
-    ) -> None:
-        step_state.status = StepStatus.SKIPPED
-        step_state.failed_by_step = failed_by_step
-        logger.info(
-            "run_id=%s step_id=%s reason=step_skipped failed_by_step=%s",
-            run_id, step_state.step_id, failed_by_step,
-        )
-
-    @staticmethod
-    def _first_blocker(
-        definition: WorkflowDef,
-        step_def: StepDef,
-        state: RunState,
-    ) -> str | None:
-        """返回导致本步骤不可推进的前置步骤 id（前置失败/被跳过）。"""
-        for dep in step_def.depends_on:
-            dep_status = state.steps[dep].status
-            if dep_status in (StepStatus.FAILED, StepStatus.SKIPPED):
-                return dep
-        return None
-
-    @staticmethod
-    def _topological_order(definition: WorkflowDef) -> list[str]:
-        """Kahn 算法；同层按定义顺序，保证输出稳定可预期。"""
-        remaining_deps = {
-            step.id: set(step.depends_on) for step in definition.steps
-        }
-        dependents: dict[str, list[str]] = {step.id: [] for step in definition.steps}
-        for step in definition.steps:
-            for dep in step.depends_on:
-                dependents[dep].append(step.id)
-
-        ready = [s.id for s in definition.steps if not remaining_deps[s.id]]
-        order: list[str] = []
-        while ready:
-            step_id = ready.pop(0)
-            order.append(step_id)
-            for downstream in dependents[step_id]:
-                remaining_deps[downstream].discard(step_id)
-                if not remaining_deps[downstream]:
-                    ready.append(downstream)
-        # 定义已通过无环校验，这里必然覆盖全部步骤
-        return order

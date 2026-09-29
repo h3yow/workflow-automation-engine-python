@@ -8,6 +8,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# 运行内步骤并发的默认上限：定义未显式配置时使用
+DEFAULT_MAX_CONCURRENCY = 4
+
+
 class StepStatus(str, enum.Enum):
     """单步骤的生命周期状态。"""
 
@@ -57,6 +61,19 @@ class DuplicateTriggerError(WorkflowError):
     def __init__(self, run_id: str) -> None:
         super().__init__(f"run {run_id} has already been triggered")
         self.run_id = run_id
+
+
+class InvalidConcurrencyError(InvalidDefinitionError):
+    """并发上限配置非法（如小于 1）；发布定义时即拒绝。
+
+    单独的 reason 码，可与其它 invalid_definition 校验失败区分；
+    仍是 InvalidDefinitionError 的子类，保持既有捕获逻辑兼容。
+    """
+
+    reason = "invalid_concurrency"
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
 
 
 class RunNotFoundError(WorkflowError):
@@ -134,6 +151,9 @@ class WorkflowDef:
     version: int
     steps: tuple[StepDef, ...]
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
+    # 单次运行内部步骤并发上限；None 表示用引擎/默认兼容值。
+    # 随版本走：每个版本可不同，触发运行时快照锁定。
+    max_concurrency: int | None = None
 
     def step_ids(self) -> frozenset[str]:
         return frozenset(step.id for step in self.steps)
@@ -168,15 +188,23 @@ class RunState:
     steps: dict[str, StepState] = field(default_factory=dict)
     started_at: float | None = None
     finished_at: float | None = None
+    # 触发时锁定的实际并发上限（定义未配置时取引擎默认值）
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 
     @staticmethod
-    def new(run_id: str, definition: WorkflowDef, now: float) -> "RunState":
+    def new(
+        run_id: str,
+        definition: WorkflowDef,
+        now: float,
+        max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    ) -> "RunState":
         steps = {step.id: StepState(step_id=step.id) for step in definition.steps}
         return RunState(
             run_id=run_id,
             definition=definition,
             steps=steps,
             started_at=now,
+            max_concurrency=max_concurrency,
         )
 
 

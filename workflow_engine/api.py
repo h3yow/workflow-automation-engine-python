@@ -13,6 +13,7 @@ from .engine import WorkflowEngine
 from .executor import ActionRegistry
 from .models import (
     DuplicateTriggerError,
+    InvalidConcurrencyError,
     InvalidDefinitionError,
     RetryPolicy,
     RunNotFoundError,
@@ -38,6 +39,7 @@ class DefinitionIn(BaseModel):
     version: int
     steps: list[StepDefIn]
     retry_policy: RetryPolicyIn | None = None
+    max_concurrency: int | None = None
 
 
 class TriggerIn(BaseModel):
@@ -56,6 +58,7 @@ def _serialize_run(state: RunState) -> dict[str, Any]:
         "run_id": state.run_id,
         "status": state.status.value,
         "definition_version": state.definition.version,
+        "max_concurrency": state.max_concurrency,
         "started_at": state.started_at,
         "finished_at": state.finished_at,
         "steps": [
@@ -100,9 +103,13 @@ def create_app(
             version=payload.version,
             raw_steps=[step.model_dump() for step in payload.steps],
             retry_policy=policy,
+            max_concurrency=payload.max_concurrency,
         )
         try:
             registry.put(definition)
+        except InvalidConcurrencyError as exc:
+            # 422 + reason=invalid_concurrency：并发上限配置非法，可与其它校验区分
+            return _error(422, InvalidConcurrencyError.reason, exc.message)
         except InvalidDefinitionError as exc:
             # 422 + reason=invalid_definition：缺信息 / 自相矛盾的定义
             return _error(422, InvalidDefinitionError.reason, exc.message)
@@ -110,6 +117,7 @@ def create_app(
             "name": definition.name,
             "version": definition.version,
             "steps": len(definition.steps),
+            "max_concurrency": definition.max_concurrency,
         }
 
     @app.post("/runs")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 
 from .models import (
+    InvalidConcurrencyError,
     InvalidDefinitionError,
     RetryPolicy,
     StepDef,
@@ -38,6 +39,7 @@ def validate_definition(definition: WorkflowDef) -> None:
     - 依赖图存在环（含自依赖）
     - 步骤级 max_attempts 覆盖值 < 1
     - 重试退避参数非法
+    - max_concurrency 显式配置为非整数或 < 1（reason=invalid_concurrency）
     """
     if not definition.name or not definition.name.strip():
         raise InvalidDefinitionError("workflow name must not be empty")
@@ -45,6 +47,19 @@ def validate_definition(definition: WorkflowDef) -> None:
         raise InvalidDefinitionError(
             f"definition version must be >= 1, got {definition.version}"
         )
+
+    # 并发上限：必须是 >= 1 的整数；非法时给独立 reason，便于与其它校验区分
+    max_concurrency = definition.max_concurrency
+    if max_concurrency is not None:
+        if isinstance(max_concurrency, bool) or not isinstance(max_concurrency, int):
+            raise InvalidConcurrencyError(
+                "max_concurrency must be an integer >= 1, got "
+                f"{type(max_concurrency).__name__}"
+            )
+        if max_concurrency < 1:
+            raise InvalidConcurrencyError(
+                f"max_concurrency must be >= 1, got {max_concurrency}"
+            )
 
     _validate_retry_policy(definition.retry_policy)
 
@@ -150,6 +165,7 @@ def build_definition(
     version: int,
     raw_steps: list[dict],
     retry_policy: RetryPolicy | None = None,
+    max_concurrency: int | None = None,
 ) -> WorkflowDef:
     """从朴素数据结构构建 WorkflowDef（只构造对象，不做发布）。"""
     steps = tuple(
@@ -165,4 +181,5 @@ def build_definition(
         version=version,
         steps=steps,
         retry_policy=retry_policy or RetryPolicy(),
+        max_concurrency=max_concurrency,
     )

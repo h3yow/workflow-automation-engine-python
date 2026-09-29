@@ -91,6 +91,37 @@ def test_invalid_definition_returns_distinguishable_422():
     logger.info("reason=api_invalid_definition_rejected http_status=422")
 
 
+def test_invalid_concurrency_returns_its_own_reason_422():
+    client, _ = _build_client()
+    resp = client.post(
+        "/definitions",
+        json={
+            "name": "wf", "version": 1,
+            "steps": [{"id": "a"}], "max_concurrency": 0,
+        },
+    )
+    assert resp.status_code == 422
+    error = resp.json()["error"]
+    # 独立 reason，与其它 invalid_definition 校验失败可区分
+    assert error["reason"] == "invalid_concurrency"
+    assert "max_concurrency" in error["message"]
+    logger.info("reason=api_invalid_concurrency_rejected http_status=422")
+
+
+def test_run_response_reports_locked_max_concurrency():
+    client, _ = _build_client()
+    client.post(
+        "/definitions",
+        json={
+            "name": "wf", "version": 1,
+            "steps": [{"id": "a"}], "max_concurrency": 3,
+        },
+    )
+    resp = client.post("/runs", json={"run_id": "run-c"})
+    assert resp.status_code == 202
+    assert resp.json()["max_concurrency"] == 3
+
+
 def test_run_not_found_returns_404():
     client, _ = _build_client()
     resp = client.get("/runs/missing")
