@@ -108,6 +108,22 @@ class FatalStepError(WorkflowError):
         self.message = message
 
 
+class EngineDispatchError(WorkflowError):
+    """引擎自身在派发/启动执行单元这一步出错（非业务动作失败）。
+
+    例如无法为新执行单元分配资源、执行单元启动器抛错。与业务步骤失败
+    （FatalStepError/RecoverableStepError）区分开，失败原因可指到
+    “哪个步骤在被派发/启动时引擎出了错”。
+    """
+
+    reason = "engine_dispatch_failure"
+
+    def __init__(self, step_id: str, message: str) -> None:
+        super().__init__(f"step {step_id}: {message}")
+        self.step_id = step_id
+        self.message = message
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     """重试与退避策略。
@@ -190,6 +206,9 @@ class RunState:
     finished_at: float | None = None
     # 触发时锁定的实际并发上限（定义未配置时取引擎默认值）
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    # 运行失败的根因步骤 id（业务步骤失败，或引擎派发/启动失败所指向的步骤）；
+    # 成功运行为 None。使“运行为什么失败、断在哪儿”在运行级即可识别。
+    failed_step_id: str | None = None
 
     @staticmethod
     def new(

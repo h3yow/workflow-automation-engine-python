@@ -38,6 +38,7 @@ def make_engine():
         actions: ActionRegistry | None = None,
         *,
         asynchronous: bool = True,
+        step_launcher=None,
     ) -> tuple[WorkflowEngine, DefinitionRegistry, ActionRegistry]:
         registry = registry or DefinitionRegistry()
         actions = actions or ActionRegistry()
@@ -47,6 +48,7 @@ def make_engine():
             sleep_protocol=InstantSleep(),
             time_func=None,
             run_asynchronously=asynchronous,
+            step_launcher=step_launcher,
         )
         created.append(engine)
         return engine, registry, actions

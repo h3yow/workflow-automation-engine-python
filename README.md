@@ -52,8 +52,17 @@ print(state.status.value, state.max_concurrency,
    ▼
  running ──全部步骤 SUCCEEDED──▶ succeeded（终态）
    │
-   └──────任一步骤 FAILED──────▶ failed（终态，其余未完成步骤 SKIPPED）
+   ├──────任一步骤业务失败──────▶ failed（终态，其余未完成步骤 SKIPPED）
+   │
+   └──引擎调度/启动环节自身出错─▶ failed（终态，故障步骤 FAILED，
+                                      其余未完成步骤 SKIPPED；
+                                      收敛规则与业务失败一致）
 ```
+
+**无论失败来自业务步骤还是引擎自身的调度/启动环节，运行结束时每个步骤都
+必然落在 `succeeded/failed/skipped` 三个明确、可区分的终态之一，绝不会残留
+`pending/ready/running` 中间态。** 运行失败时 `RunState.failed_step_id` 指向
+根因步骤 id；`GET /runs/{run_id}` 响应同样带该字段，可直接定位断裂点。
 
 ### 2.2 步骤（Step）状态
 
@@ -82,6 +91,15 @@ pending ──全部前置 SUCCEEDED 且有空闲名额──▶ ready ──▶
   已经在失败前完成、以及失败时已经在跑且自然跑完的成功步骤保留其真实
   `succeeded` 状态，不回退、不重标。
 - `failed` 与 `skipped` 是两个**可区分的终止状态**，与 `succeeded` 三者互斥。
+- **引擎自身故障与业务失败同口径收敛**：当引擎在派发/启动执行单元这一步出
+  岔子（启动器抛错、系统资源不足开不出新执行单元等，*非业务动作失败*）时，
+  正被派发的步骤记 `failed`（`attempts=0`，`error` 以
+  `engine_dispatch_failure:` 前缀标识，可与业务 `fatal_step_failure` 区分，
+  并能定位到具体是哪个步骤没被开起来），失败闸门立即关闭，后续规则与业务
+  失败完全一致——出错前/出错时已在跑且成功的步骤保持 `succeeded`，没机会跑
+  的步骤 `skipped` 且 `failed_by_step` 回溯到该故障步骤。调度器自身的其它
+  意外异常则由最后防线兜底：拓扑序第一个未决步骤记为引擎故障根因，再统一
+  收敛，同样不留中间态。
 
 ## 2.3 运行内部并发调度
 
@@ -113,7 +131,30 @@ pending ──全部前置 SUCCEEDED 且有空闲名额──▶ ready ──▶
    调度时序；二者都是明确终态，且回溯口径一致——运行的最终成败结论始终确定。）
 6. 收敛阶段按拓扑序扫尾，保证**没有任何步骤停在中间态**。
 
-### 2.3.2 并发上限的配置、默认值与版本兼容
+### 2.3.2 引擎侧调度/启动故障的收敛（与业务失败边界一致）
+
+派发/启动执行单元的动作经 `StepLauncher` 接缝完成
+（`scheduler.py`，默认实现 `ThreadStepLauncher` 为每步起一个守护线程；
+`WorkflowEngine(..., step_launcher=...)` 可替换，用于故障注入或换执行后端）。
+当该接缝在启动某步骤时抛错（引擎故障，如资源不足无法创建执行单元）：
+
+1. 该步骤判 `failed`，`error` 形如
+   `engine_dispatch_failure: could not launch execution unit (<异常类型>: <细节>)`，
+   `attempts=0`（业务动作一次都没跑过），该步骤即根因；运行整体 `failed`，
+   `RunState.failed_step_id` 指到它，失败原因可定位到可识别的位置。
+2. 派发闸门在同一把调度锁内立即关闭并回滚并发名额，**故障之后不再开任何新
+   执行单元**；正常路径上的并发上限、依赖满足才开工等行为不受影响。
+3. 出错前已经成功的步骤保持 `succeeded`，**不回退、不重标**；出错时已经在
+   别的分支上跑的步骤让其自然跑完，成功仍记 `succeeded`、自身失败则记
+   `failed`（规则与业务失败收敛完全一致）。
+4. 其余没跑起来的步骤（含仍在就绪队列排队者）统一 `skipped`，
+   `failed_by_step` 为其第一个 failed/skipped 的直接前置，否则直接记根因
+   步骤，**追溯链可逐级走到故障步骤，不出现来源为空的 skipped**。
+5. 即使调度器内部抛出更意外的异常，调度器与引擎各有一层兜底收敛
+   （`force_terminate_after_engine_crash`），保证终态与追溯信息仍然齐全；
+   同样定义 + 同样故障反复触发，根因与每步终态结论稳定一致。
+
+### 2.3.3 并发上限的配置、默认值与版本兼容
 
 - 配置随**定义版本**走：`WorkflowDef.max_concurrency: int | None`，
   `build_definition(..., max_concurrency=N)`；每个版本可以不同。
@@ -187,7 +228,7 @@ pending ──全部前置 SUCCEEDED 且有空闲名额──▶ ready ──▶
 |---|---|---|
 | `POST /definitions` | 发布新定义版本（可带 `max_concurrency`） | `200`；非法定义 `422 invalid_definition`；并发上限非法 `422 invalid_concurrency` |
 | `POST /runs` | 触发运行（可带 `run_id`） | `202`（响应含锁定的 `max_concurrency`）；重复触发 `409 duplicate_trigger` |
-| `GET /runs/{run_id}` | 查询运行与每步状态 | `200`（含 `max_concurrency`）；不存在 `404 run_not_found` |
+| `GET /runs/{run_id}` | 查询运行与每步状态 | `200`（含 `max_concurrency` 与失败根因 `failed_step_id`）；不存在 `404 run_not_found` |
 | `GET /health` | 健康检查 | `200` |
 
 错误响应结构：`{"error": {"reason": "<可区分原因码>", "message": "<细节>"}}`。
@@ -207,12 +248,13 @@ curl -X POST localhost:8000/definitions -H 'content-type: application/json' -d '
 
 ```bash
 uv sync
-uv run pytest                                  # 全部 29 个用例
+uv run pytest                                  # 全部 34 个用例
 uv run pytest --log-cli-level=INFO             # 同时查看引擎判定日志
 uv run pytest tests/test_concurrent_trigger.py # 场景一：并发重复触发（不回归）
 uv run pytest tests/test_retry_failure.py      # 场景二：可恢复失败重试 / 致命失败（不回归）
 uv run pytest tests/test_definition_versioning.py  # 场景三：运行中定义变更（不回归）
-uv run pytest tests/test_intra_run_concurrency.py  # 新增：运行内部有界并发
+uv run pytest tests/test_intra_run_concurrency.py  # 运行内部有界并发（不回归）
+uv run pytest tests/test_engine_dispatch_failure.py  # 新增：引擎派发/启动故障收敛
 uv run pytest tests/test_api.py                # HTTP 可区分错误码（含 invalid_concurrency）
 ```
 
@@ -237,6 +279,17 @@ uv run pytest tests/test_api.py                # HTTP 可区分错误码（含 i
    - `max_concurrency` 为 `0/-1/-99` 发布时抛 `invalid_concurrency`，可与
      `invalid_definition` 区分；引擎默认上限非法也被拒绝；
    - 相同定义与动作重复触发 5 次，最终运行结论与每步终态完全一致。
+5. **引擎派发/启动故障收敛**（`test_engine_dispatch_failure.py`，5 例）：
+   - 经 `FailingStepLauncher` 在第二个就绪步骤启动时注入 `RuntimeError` /
+     `OSError(11)`（资源不足），断言运行 `failed`、`failed_step_id` 指到
+     故障点、该步骤 `error` 带 `engine_dispatch_failure` 前缀且 `attempts=0`；
+   - 出错前已成功的 `root` 与出错时已在跑的分支 `a` 保持 `succeeded`，
+     未跑起来的 `a_tail`/`slow` 均为 `skipped` 且 `failed_by_step` 可回溯到
+     故障步骤；所有步骤落在终态、追溯链逐级可达 FAILED；
+   - 首批步骤（root）启动即失败：全部下游 `skipped`，直接下游来源为 root、
+     间接下游逐级回溯，追溯链不断；
+   - 调度器内部抛未预期异常时，最后防线仍把每个步骤收敛到明确终态；
+   - 同样定义 + 同样故障重复触发 3 次，运行结论与每步终态完全一致。
 
 单测日志（logger 名 `workflow_engine` / `workflow_engine.test`）中每条判定都打印
 **运行标识 `run_id`、步骤标识 `step_id` 与判定依据 `reason=...`**，例如：
@@ -253,11 +306,13 @@ WARNING run_id=run-concurrent-1 reason=duplicate_trigger_rejected existing_statu
 ```
 main.py                       # FastAPI 入口（uvicorn main:app）
 workflow_engine/
-  models.py                   # 状态枚举、数据结构、异常类型（含 DEFAULT_MAX_CONCURRENCY）
+  models.py                   # 状态枚举、数据结构、异常类型（含 DEFAULT_MAX_CONCURRENCY、
+                              # EngineDispatchError 引擎派发/启动故障；RunState.failed_step_id）
   definitions.py              # 定义构建、DAG/并发上限校验、版本注册表
   executor.py                 # 动作注册表、单步骤执行、重试退避
-  scheduler.py                # 运行内部有界并发调度：依赖感知、满额排队、失败收敛
-  engine.py                   # 编排引擎：幂等触发、调度器装配、定义/并发度快照
+  scheduler.py                # 运行内有界并发调度：依赖感知、满额排队、失败收敛、
+                              # StepLauncher 启动接缝、引擎故障兜底收敛（force_terminate_*）
+  engine.py                   # 编排引擎：幂等触发、调度器/启动器装配、定义/并发度快照
   api.py                      # HTTP 路由与可区分错误响应
-tests/                        # 并发重复触发/重试/版本/运行内并发/API/冒烟
+tests/                        # 并发触发/重试/版本/运行内并发/引擎派发故障/API/冒烟
 ```

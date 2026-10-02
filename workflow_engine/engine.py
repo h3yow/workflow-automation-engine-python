@@ -19,7 +19,12 @@ from .models import (
     WorkflowDef,
     new_run_id,
 )
-from .scheduler import ConcurrentScheduler
+from .scheduler import (
+    ConcurrentScheduler,
+    StepLauncher,
+    ThreadStepLauncher,
+    force_terminate_after_engine_crash,
+)
 
 logger = logging.getLogger("workflow_engine")
 
@@ -40,6 +45,11 @@ class WorkflowEngine:
     - 步骤失败（不可恢复或重试耗尽）后：该步骤 FAILED 且成为根因，
       不再派发任何新步骤；在跑的其它分支自然跑完；最终所有未决步骤
       收敛为 SKIPPED（failed_by_step 可回溯到根因），运行整体 FAILED。
+    - 引擎自身在派发/启动执行单元环节出错（启动器抛错、资源不足开不出
+      新执行单元等）时，适用同一套收敛规则：被派发的步骤 FAILED（error
+      带 engine_dispatch_failure 前缀，可定位到具体步骤），失败闸门立即
+      关闭，已在跑的分支自然跑完、成功不回退，其余未开始步骤 SKIPPED 且
+      failed_by_step 可回溯到断裂步骤，不残留 pending/ready 中间态。
     """
 
     def __init__(
@@ -50,6 +60,7 @@ class WorkflowEngine:
         time_func: Callable[[], float] | None = None,
         run_asynchronously: bool = True,
         default_max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        step_launcher: StepLauncher | None = None,
     ) -> None:
         if isinstance(default_max_concurrency, bool) or not isinstance(
             default_max_concurrency, int
@@ -67,6 +78,8 @@ class WorkflowEngine:
         self._async = run_asynchronously
         # 定义未显式配置并发上限（如历史旧版本）时使用的兼容默认值
         self._default_max_concurrency = default_max_concurrency
+        # 执行单元启动接缝：默认每步一个守护线程；测试/故障注入可替换
+        self._step_launcher = step_launcher or ThreadStepLauncher()
         self._registry_lock = threading.Lock()
         self._runs: dict[str, RunState] = {}
         self._run_threads: dict[str, threading.Thread] = {}
@@ -184,6 +197,7 @@ class WorkflowEngine:
                 executor=self._executor,
                 results=results,
                 time_func=self._time,
+                step_launcher=self._step_launcher,
             )
             failed_root = scheduler.run()
 
@@ -197,6 +211,7 @@ class WorkflowEngine:
                 )
             else:
                 state.status = RunStatus.FAILED
+                state.failed_step_id = failed_root
                 state.finished_at = self._time()
                 logger.error(
                     "run_id=%s reason=run_failed failed_step_id=%s "
@@ -204,10 +219,20 @@ class WorkflowEngine:
                     run_id, failed_root, definition.version,
                     state.max_concurrency,
                 )
-        except Exception:
+        except Exception as exc:
+            # 调度器理论上已自行收敛所有故障（含引擎派发/启动失败）；
+            # 此处是最后防线：仍保证每个步骤落到明确终态、根因可识别。
             logger.exception("run_id=%s reason=run_crashed", run_id)
             state.status = RunStatus.FAILED
+            root = force_terminate_after_engine_crash(
+                state, self._time, exc
+            )
+            state.failed_step_id = root
             state.finished_at = self._time()
+            logger.error(
+                "run_id=%s reason=run_crashed_converged failed_step_id=%s",
+                run_id, root,
+            )
         finally:
             state.finished_at = state.finished_at or self._time()
             with self._registry_lock:

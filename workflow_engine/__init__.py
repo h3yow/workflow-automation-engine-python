@@ -12,6 +12,7 @@ from .engine import WorkflowEngine
 from .executor import ActionRegistry, StepExecutor
 from .models import (
     DEFAULT_MAX_CONCURRENCY,
+    EngineDispatchError,
     FatalStepError,
     InvalidConcurrencyError,
     InvalidDefinitionError,
@@ -29,6 +30,7 @@ __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
     "ActionRegistry",
     "DefinitionRegistry",
+    "EngineDispatchError",
     "FatalStepError",
     "InvalidConcurrencyError",
     "InvalidDefinitionError",

@@ -57,6 +57,7 @@ def _serialize_run(state: RunState) -> dict[str, Any]:
     return {
         "run_id": state.run_id,
         "status": state.status.value,
+        "failed_step_id": state.failed_step_id,
         "definition_version": state.definition.version,
         "max_concurrency": state.max_concurrency,
         "started_at": state.started_at,
