@@ -12,14 +12,21 @@ from .definitions import DefinitionRegistry
 from .executor import ActionRegistry, SleepProtocol, StepExecutor
 from .models import (
     DEFAULT_MAX_CONCURRENCY,
+    ENGINE_FAILURE_SOURCE,
     DuplicateTriggerError,
+    EngineDispatchError,
     RunNotFoundError,
     RunState,
     RunStatus,
+    StepStatus,
     WorkflowDef,
     new_run_id,
 )
-from .scheduler import ConcurrentScheduler
+from .scheduler import (
+    ConcurrentScheduler,
+    SchedulerOutcome,
+    StepUnitLauncher,
+)
 
 logger = logging.getLogger("workflow_engine")
 
@@ -40,6 +47,10 @@ class WorkflowEngine:
     - 步骤失败（不可恢复或重试耗尽）后：该步骤 FAILED 且成为根因，
       不再派发任何新步骤；在跑的其它分支自然跑完；最终所有未决步骤
       收敛为 SKIPPED（failed_by_step 可回溯到根因），运行整体 FAILED。
+    - 引擎自身在派发/启动执行单元环节出错（准备单元抛错、资源不足
+      无法再开新单元等）：与业务失败走同一收敛口径——在跑步骤自然
+      跑完，已成功步骤不回退，其余步骤 SKIPPED（failed_by_step 不为空，
+      引擎侧断裂点为 "engine:scheduler"，具体位置记在 RunState.error）。
     """
 
     def __init__(
@@ -50,6 +61,7 @@ class WorkflowEngine:
         time_func: Callable[[], float] | None = None,
         run_asynchronously: bool = True,
         default_max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+        unit_launcher: StepUnitLauncher | None = None,
     ) -> None:
         if isinstance(default_max_concurrency, bool) or not isinstance(
             default_max_concurrency, int
@@ -67,6 +79,8 @@ class WorkflowEngine:
         self._async = run_asynchronously
         # 定义未显式配置并发上限（如历史旧版本）时使用的兼容默认值
         self._default_max_concurrency = default_max_concurrency
+        # 执行单元启动器：默认以守护线程承载，可注入故障替身做引擎故障演练
+        self._unit_launcher = unit_launcher
         self._registry_lock = threading.Lock()
         self._runs: dict[str, RunState] = {}
         self._run_threads: dict[str, threading.Thread] = {}
@@ -176,7 +190,6 @@ class WorkflowEngine:
 
     def _run_pipeline(self, run_id: str) -> None:
         state = self.get_run(run_id)
-        definition = state.definition  # 快照：运行期间定义变更与本运行无关
         try:
             results = self._results[run_id]
             scheduler = ConcurrentScheduler(
@@ -184,30 +197,21 @@ class WorkflowEngine:
                 executor=self._executor,
                 results=results,
                 time_func=self._time,
+                unit_launcher=self._unit_launcher,
             )
-            failed_root = scheduler.run()
-
-            if failed_root is None:
-                state.status = RunStatus.SUCCEEDED
-                state.finished_at = self._time()
-                logger.info(
-                    "run_id=%s reason=run_succeeded def_version=%d "
-                    "max_concurrency=%d",
-                    run_id, definition.version, state.max_concurrency,
-                )
-            else:
-                state.status = RunStatus.FAILED
-                state.finished_at = self._time()
-                logger.error(
-                    "run_id=%s reason=run_failed failed_step_id=%s "
-                    "def_version=%d max_concurrency=%d",
-                    run_id, failed_root, definition.version,
-                    state.max_concurrency,
-                )
-        except Exception:
+            outcome = scheduler.run()
+            self._apply_outcome(state, outcome)
+        except Exception as exc:
+            # 最后防线：即便调度器本身意外漏出异常，也不能留下非终态步骤，
+            # 且失败原因必须指到可识别位置。
             logger.exception("run_id=%s reason=run_crashed", run_id)
-            state.status = RunStatus.FAILED
-            state.finished_at = self._time()
+            self._force_engine_failure(
+                state,
+                EngineDispatchError(
+                    f"run pipeline crashed: {type(exc).__name__}: {exc}",
+                    location="run_pipeline",
+                ),
+            )
         finally:
             state.finished_at = state.finished_at or self._time()
             with self._registry_lock:
@@ -217,3 +221,79 @@ class WorkflowEngine:
                 "run_id=%s reason=run_finished final_status=%s",
                 run_id, state.status.value,
             )
+
+    def _apply_outcome(self, state: RunState, outcome: SchedulerOutcome) -> None:
+        """把调度结论落到运行状态；引擎故障优先于业务根因判定运行失败原因。"""
+        run_id = state.run_id
+
+        if outcome.engine_failure is not None:
+            failure = outcome.engine_failure
+            target = failure.step_id
+            state.status = RunStatus.FAILED
+            state.finished_at = self._time()
+            state.error = (
+                f"{failure.reason} at {failure.location}"
+                + (f" while starting step {target}" if target else "")
+                + f": {failure.message}"
+            )
+            logger.error(
+                "run_id=%s reason=run_failed cause=engine location=%s "
+                "target_step=%s failed_step_id=%s def_version=%d "
+                "max_concurrency=%d detail=%s",
+                run_id, failure.location, target or "-",
+                outcome.failed_root or "-", state.definition.version,
+                state.max_concurrency, failure.message,
+            )
+        elif outcome.failed_root is not None:
+            root = outcome.failed_root
+            state.status = RunStatus.FAILED
+            state.finished_at = self._time()
+            root_error = state.steps[root].error
+            state.error = (
+                f"step_failure root_step={root}"
+                + (f": {root_error}" if root_error else "")
+            )
+            logger.error(
+                "run_id=%s reason=run_failed cause=step failed_step_id=%s "
+                "def_version=%d max_concurrency=%d",
+                run_id, root, state.definition.version, state.max_concurrency,
+            )
+        else:
+            state.status = RunStatus.SUCCEEDED
+            state.finished_at = self._time()
+            logger.info(
+                "run_id=%s reason=run_succeeded def_version=%d "
+                "max_concurrency=%d",
+                run_id, state.definition.version, state.max_concurrency,
+            )
+
+    def _force_engine_failure(
+        self, state: RunState, failure: EngineDispatchError
+    ) -> None:
+        """异常兜底：把运行判失败并把任何非终态步骤收敛为 SKIPPED。"""
+        for step_state in state.steps.values():
+            if step_state.status in (
+                StepStatus.SUCCEEDED, StepStatus.FAILED, StepStatus.SKIPPED,
+            ):
+                continue
+            step_def = state.definition.get_step(step_state.step_id)
+            blocker = None
+            if step_def is not None:
+                for dep in step_def.depends_on:
+                    dep_state = state.steps.get(dep)
+                    if dep_state is not None and dep_state.status in (
+                        StepStatus.FAILED, StepStatus.SKIPPED,
+                    ):
+                        blocker = dep
+                        break
+            step_state.status = StepStatus.SKIPPED
+            step_state.failed_by_step = blocker or ENGINE_FAILURE_SOURCE
+            logger.error(
+                "run_id=%s step_id=%s reason=step_skipped_crash_net "
+                "failed_by_step=%s",
+                state.run_id, step_state.step_id, step_state.failed_by_step,
+            )
+        state.status = RunStatus.FAILED
+        state.error = (
+            f"{failure.reason} at {failure.location}: {failure.message}"
+        )

@@ -108,6 +108,35 @@ class FatalStepError(WorkflowError):
         self.message = message
 
 
+class EngineDispatchError(WorkflowError):
+    """引擎自身在派发/启动执行单元环节出错（非业务动作失败）。
+
+    例如准备执行单元时抛错、系统资源不足无法再启动新的执行单元等。
+    location 给出可识别的出错位置（环节名），step_id 为当时正准备启动
+    的步骤（可能为 None：出错时没有具体步骤）。
+    """
+
+    reason = "engine_dispatch_failure"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        location: str,
+        step_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.location = location
+        self.step_id = step_id
+
+
+# 引擎自身出错时，被跳过步骤 failed_by_step 使用的稳定来源标识。
+# 它不指向任何业务步骤，表示“断裂来自引擎调度/启动环节”；
+# 具体出错位置由 RunState.error 中的 reason/location 给出。
+ENGINE_FAILURE_SOURCE = "engine:scheduler"
+
+
 @dataclass(frozen=True)
 class RetryPolicy:
     """重试与退避策略。
@@ -188,6 +217,9 @@ class RunState:
     steps: dict[str, StepState] = field(default_factory=dict)
     started_at: float | None = None
     finished_at: float | None = None
+    # 运行整体失败的可追溯原因：业务失败时指向根因步骤；
+    # 引擎自身调度/启动出错时记录出错环节与位置。成功运行恒为 None。
+    error: str | None = None
     # 触发时锁定的实际并发上限（定义未配置时取引擎默认值）
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
 

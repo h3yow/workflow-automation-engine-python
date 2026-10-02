@@ -12,6 +12,8 @@ from .engine import WorkflowEngine
 from .executor import ActionRegistry, StepExecutor
 from .models import (
     DEFAULT_MAX_CONCURRENCY,
+    ENGINE_FAILURE_SOURCE,
+    EngineDispatchError,
     FatalStepError,
     InvalidConcurrencyError,
     InvalidDefinitionError,
@@ -24,11 +26,18 @@ from .models import (
     StepStatus,
     WorkflowDef,
 )
+from .scheduler import (
+    SchedulerOutcome,
+    StepUnitLauncher,
+    ThreadStepUnitLauncher,
+)
 
 __all__ = [
     "DEFAULT_MAX_CONCURRENCY",
+    "ENGINE_FAILURE_SOURCE",
     "ActionRegistry",
     "DefinitionRegistry",
+    "EngineDispatchError",
     "FatalStepError",
     "InvalidConcurrencyError",
     "InvalidDefinitionError",
@@ -36,10 +45,13 @@ __all__ = [
     "RetryPolicy",
     "RunState",
     "RunStatus",
+    "SchedulerOutcome",
     "StepDef",
     "StepExecutor",
     "StepState",
     "StepStatus",
+    "StepUnitLauncher",
+    "ThreadStepUnitLauncher",
     "WorkflowDef",
     "WorkflowEngine",
     "build_definition",
